@@ -12,7 +12,11 @@
 4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
    **最小观测删除集合**（按删除数量、观测 ID 字典序唯一确定），返回待删观测 ID、
    修复后的诊断摘要，以及是否触及删除上限；
-5. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+5. **校准计划**：基础观测可行时，从至多 12 条带成本的候选校准观测中选取
+   **总成本最小** 的子集加入，使所有目标节点相对参考节点的上下界均有限且
+   区间宽度达标（同成本取条数最少、再取 ID 字典序最小，结果唯一）；
+   基础观测矛盾时直接返回现有矛盾环，无解时给出明确状态；
+6. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -320,6 +324,145 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
 }
 ```
 
+### `POST /api/v1/diagnose/calibration-plan` — 校准计划
+
+请求体沿用单条诊断请求的全部字段（`reference` / `observations` / `nodes` / `name`），
+并增加两个字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `targets` | array | 是 | 目标节点要求列表，至少 1 条，`node` 不可重复 |
+| `targets[].node` | string | 是 | 目标节点（自动并入节点集合） |
+| `targets[].max_width` | number | 是 | 允许的区间宽度上限（毫秒），须为 ≥ 0 的有限数值 |
+| `candidates` | array | 否 | 候选校准观测列表，**至多 12 条**，缺省为空 |
+| `candidates[].id` | string | 是 | 候选唯一 ID，且不得与基础观测 ID 重复 |
+| `candidates[].source` / `target` | string | 是 | 同基础观测语义 |
+| `candidates[].min` / `max` | number | 是 | 区间端点（毫秒），须 `min ≤ max` |
+| `candidates[].cost` | integer | 是 | 选用该候选的成本，须为 **非负整数** |
+
+语义：先对基础观测（`observations`）做诊断——**若基础系统矛盾，直接返回现有
+矛盾环**（`status=base_infeasible`），不做任何选择。否则从候选中选取子集加入，
+使加入后每个目标节点相对参考节点的 **上下界均有限** 且 `upper - lower ≤ max_width`；
+**使系统矛盾的候选组合不可选**。选择优先级唯一确定最优解：
+
+1. **总成本最小**；
+2. 同成本取 **条数最少**；
+3. 再同取 **ID 排序后序列字典序最小**。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `name` | string/null | 请求名称回显 |
+| `status` | string | `ok` / `no_feasible_plan` / `base_infeasible` |
+| `selected_ids` | string[] | 选中的候选 ID（字典序）；未找到方案时为空 |
+| `total_cost` | integer/null | 选中候选的成本之和；未找到方案时为 `null` |
+| `diagnosis` | object | `ok` 时为加入选中候选后的诊断；`base_infeasible` 时为基础系统的不可行诊断（含矛盾环）；`no_feasible_plan` 时为基础系统的可行诊断 |
+
+#### 找到最优方案（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10}
+    ],
+    "targets": [{"node": "B", "max_width": 4}],
+    "candidates": [
+      {"id": "c1", "source": "A", "target": "B", "min": 0, "max": 4, "cost": 3},
+      {"id": "c2", "source": "A", "target": "B", "min": 0, "max": 4, "cost": 5}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "ok",
+  "selected_ids": ["c1"],
+  "total_cost": 3,
+  "diagnosis": {
+    "feasible": true,
+    "reference": "A",
+    "name": null,
+    "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0,
+       "lower_proof": [], "upper_proof": [],
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
+      {"node": "B", "lower": 0.0, "upper": 4.0,
+       "lower_proof": [
+         {"observation_id": "c1", "constraint": "lower", "from": "B", "to": "A", "weight": 0.0}
+       ],
+       "upper_proof": [
+         {"observation_id": "c1", "constraint": "upper", "from": "A", "to": "B", "weight": 4.0}
+       ],
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
+    ],
+    "unconstrained_nodes": []
+  }
+}
+```
+
+`c1` 与 `c2` 都能把 `x_B - x_A` 收紧到 `[0, 4]`（宽 4 达标），选成本更低的 `c1`。
+
+#### 基础观测矛盾（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ],
+    "targets": [{"node": "B", "max_width": 4}],
+    "candidates": [
+      {"id": "c1", "source": "A", "target": "B", "min": 0, "max": 4, "cost": 1}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "base_infeasible",
+  "selected_ids": [],
+  "total_cost": null,
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "o2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "o1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
+#### 无解（示例）
+
+目标宽度过严、候选不足以收紧时返回 `no_feasible_plan`，`diagnosis` 为基础系统
+的可行诊断（便于对照当前差距）：
+
+```json
+{
+  "name": null,
+  "status": "no_feasible_plan",
+  "selected_ids": [],
+  "total_cost": null,
+  "diagnosis": {"feasible": true, "reference": "A", "name": null, "node_bounds": ["..."], "unconstrained_nodes": []}
+}
+```
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -345,7 +488,8 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
 
 ### 校验错误
 
-非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中等请求问题返回
+非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中、候选超过 12 条、
+候选 ID 重复或与基础观测冲突、成本为负数或小数、目标节点重复等请求问题返回
 HTTP `422` 及详细错误信息。
 
 ---
@@ -366,6 +510,9 @@ HTTP `422` 及详细错误信息。
   的最短路本身；链即界的可审计解释；
 - **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解。
+- **校准计划**：候选至多 12 条，按 (总成本, 条数, ID 字典序序列) 递增穷举子集，
+  首个使「基础 + 选中」可行且全部目标节点宽度达标的子集即唯一方案；
+  空子集成本为 0，基础系统已达标时即选空集。
 
 结果顺序的确定性保证：
 
@@ -380,10 +527,10 @@ HTTP `422` 及详细错误信息。
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索
-tests/         # 算法层与 HTTP 接口测试（52 个用例）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准子集搜索
+tests/         # 算法层与 HTTP 接口测试（87 个用例）
 Dockerfile
 docker-compose.yml
 ```

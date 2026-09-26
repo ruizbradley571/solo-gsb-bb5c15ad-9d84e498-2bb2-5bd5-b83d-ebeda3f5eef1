@@ -222,3 +222,114 @@ class RepairResponse(BaseModel):
     diagnosis: Union[FeasibleDiagnosis, InfeasibleDiagnosis] = Field(
         ..., discriminator="feasible", description="应用建议后的诊断摘要"
     )
+
+
+class TargetRequirement(BaseModel):
+    """一个目标节点的宽度要求：上下界均有限且 upper - lower ≤ max_width。"""
+
+    node: str = Field(..., min_length=1, description="目标节点")
+    max_width: float = Field(
+        ...,
+        ge=0,
+        description="允许的区间宽度上限（毫秒，须 ≥ 0）："
+        "要求该节点相对参考节点的上下界均有限且宽度不超过该值",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "TargetRequirement":
+        if not math.isfinite(self.max_width):
+            raise ValueError("max_width 必须为有限数值")
+        return self
+
+
+class CandidateObservationIn(BaseModel):
+    """一条候选校准观测：可选加入基础系统，附带非负整数成本。"""
+
+    id: str = Field(..., min_length=1, description="候选观测的唯一 ID")
+    source: str = Field(..., min_length=1, description="被减时钟节点 A")
+    target: str = Field(..., min_length=1, description="被减时钟节点 B")
+    min: float = Field(..., alias="min", description="区间下界（毫秒）")
+    max: float = Field(..., alias="max", description="区间上界（毫秒）")
+    cost: int = Field(..., ge=0, description="选用该候选的非负整数成本")
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "CandidateObservationIn":
+        if not math.isfinite(self.min) or not math.isfinite(self.max):
+            raise ValueError("min/max 必须为有限数值")
+        if self.min > self.max:
+            raise ValueError(
+                f"候选观测 {self.id} 的区间非法：min({self.min}) > max({self.max})"
+            )
+        return self
+
+
+class CalibrationPlanRequest(DiagnosisRequest):
+    """校准计划请求：在单条诊断请求的基础上增加目标宽度要求与候选观测。"""
+
+    targets: List[TargetRequirement] = Field(
+        ..., min_length=1, description="目标节点及其允许的最大区间宽度"
+    )
+    candidates: List[CandidateObservationIn] = Field(
+        default_factory=list,
+        max_length=12,
+        description="候选校准观测（至多 12 条，ID 唯一，成本为非负整数）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "CalibrationPlanRequest":
+        target_nodes = [t.node for t in self.targets]
+        if len(target_nodes) != len(set(target_nodes)):
+            raise ValueError("targets 中存在重复的目标节点")
+
+        candidate_ids = [c.id for c in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("candidates 中存在重复的候选 ID")
+        base_ids = {o.id for o in self.observations}
+        overlap = base_ids & set(candidate_ids)
+        if overlap:
+            raise ValueError(
+                f"候选 ID 与基础观测 ID 冲突：{sorted(overlap)}"
+            )
+        return self
+
+    def effective_nodes(self) -> List[str]:
+        """合并显式节点、参考节点、目标节点与基础/候选观测端点。"""
+        nodes = set(
+            collect_nodes(
+                self.nodes, self.reference, [*self.observations, *self.candidates]
+            )
+        )
+        nodes.update(t.node for t in self.targets)
+        return sorted(nodes)
+
+
+class CalibrationPlanResponse(BaseModel):
+    """校准计划响应。
+
+    基础观测矛盾时 ``status`` 为 ``base_infeasible`` 并回传基础系统的矛盾环；
+    否则为 ``ok``（找到最优子集）或 ``no_feasible_plan``（无解），
+    ``diagnosis`` 为加入选中候选后的诊断。
+    """
+
+    name: Optional[str] = None
+    status: Literal["ok", "no_feasible_plan", "base_infeasible"] = Field(
+        ...,
+        description="ok=已选中最优子集；no_feasible_plan=候选任意组合均无法"
+        "同时满足全部目标；base_infeasible=基础观测本身矛盾",
+    )
+    selected_ids: List[str] = Field(
+        ..., description="选中的候选观测 ID（按字典序）；未找到方案时为空"
+    )
+    total_cost: Optional[int] = Field(
+        ..., description="选中候选的成本之和；未找到方案时为 null"
+    )
+    diagnosis: Union[FeasibleDiagnosis, InfeasibleDiagnosis] = Field(
+        ...,
+        discriminator="feasible",
+        description="加入选中候选后的诊断；base_infeasible 时为基础系统的"
+        "不可行诊断（含矛盾环），no_feasible_plan 时为基础系统的可行诊断",
+    )

@@ -1,5 +1,7 @@
 """FastAPI 接口测试。"""
 
+import itertools
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -473,3 +475,302 @@ def test_repair_explicit_nodes_are_retained():
     diag = data["diagnosis"]
     assert [b["node"] for b in diag["node_bounds"]] == ["A", "B", "C"]
     assert diag["unconstrained_nodes"] == ["C"]
+
+
+def _calibration_payload(**overrides):
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10}
+        ],
+        "targets": [{"node": "B", "max_width": 4}],
+        "candidates": [
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 3},
+            {"id": "c2", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 5},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_calibration_plan_ok_selects_cheapest():
+    resp = client.post(
+        "/api/v1/diagnose/calibration-plan", json=_calibration_payload()
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["selected_ids"] == ["c1"]
+    assert data["total_cost"] == 3
+    diag = data["diagnosis"]
+    assert diag["feasible"] is True
+    b = next(x for x in diag["node_bounds"] if x["node"] == "B")
+    # o1 ∩ c1：x_B - x_A ∈ [0, 4]
+    assert b["lower"] == 0.0 and b["upper"] == 4.0
+
+
+def test_calibration_plan_empty_selection_when_already_satisfied():
+    payload = _calibration_payload(
+        observations=[{"id": "o1", "source": "A", "target": "B",
+                       "min": 1, "max": 3}],
+        targets=[{"node": "B", "max_width": 4}],
+        candidates=[],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["selected_ids"] == [] and data["total_cost"] == 0
+    assert data["diagnosis"]["feasible"] is True
+
+
+def test_calibration_plan_base_infeasible_returns_cycle():
+    payload = _calibration_payload(
+        observations=[
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "base_infeasible"
+    assert data["selected_ids"] == [] and data["total_cost"] is None
+    diag = data["diagnosis"]
+    assert diag["feasible"] is False
+    assert diag["cycle"]["accumulated_bound"] == -3.0
+    steps = diag["cycle"]["steps"]
+    for i, step in enumerate(steps):
+        assert step["from"] == steps[i - 1]["to"]
+
+
+def test_calibration_plan_no_feasible_plan():
+    payload = _calibration_payload(
+        targets=[{"node": "B", "max_width": 1}],
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1}
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "no_feasible_plan"
+    assert data["selected_ids"] == [] and data["total_cost"] is None
+    # 回传基础系统的可行诊断便于对照
+    diag = data["diagnosis"]
+    assert diag["feasible"] is True
+    b = next(x for x in diag["node_bounds"] if x["node"] == "B")
+    assert b["lower"] == 0.0 and b["upper"] == 10.0
+
+
+def test_calibration_plan_unbounded_target_connected_by_candidate():
+    payload = _calibration_payload(
+        observations=[],
+        nodes=["A", "B"],
+        targets=[{"node": "B", "max_width": 5}],
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 1, "max": 4, "cost": 2}
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["selected_ids"] == ["c1"] and data["total_cost"] == 2
+    b = next(x for x in data["diagnosis"]["node_bounds"] if x["node"] == "B")
+    assert b["lower"] == 1.0 and b["upper"] == 4.0
+
+
+def test_calibration_plan_skips_contradictory_candidate():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 11, "max": 20, "cost": 1},   # 与 o1 矛盾，不可选
+            {"id": "c2", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 2},
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["selected_ids"] == ["c2"] and data["total_cost"] == 2
+
+
+def test_calibration_plan_tie_breaks_by_count_then_ids():
+    # 同成本：c1 单独（1 条）优于 c2+c3（2 条）；同价等效时取 ID 较小者
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 2},
+            {"id": "c2", "source": "A", "target": "B",
+             "min": 0, "max": 7, "cost": 1},
+            {"id": "c3", "source": "A", "target": "B",
+             "min": 3, "max": 10, "cost": 1},
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["selected_ids"] == ["c1"] and data["total_cost"] == 2
+
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c2", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 3},
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 3},
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["selected_ids"] == ["c1"] and data["total_cost"] == 3
+
+
+def test_calibration_plan_diagnosis_includes_candidate_only_nodes():
+    # 候选引入的新节点进入诊断节点集合
+    payload = _calibration_payload(
+        targets=[{"node": "B", "max_width": 4}, {"node": "C", "max_width": 6}],
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 2},
+            {"id": "c2", "source": "B", "target": "C",
+             "min": 0, "max": 2, "cost": 1},
+        ],
+    )
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["selected_ids"] == ["c1", "c2"] and data["total_cost"] == 3
+    nodes = [b["node"] for b in data["diagnosis"]["node_bounds"]]
+    assert nodes == ["A", "B", "C"]
+    c = next(x for x in data["diagnosis"]["node_bounds"] if x["node"] == "C")
+    assert c["lower"] == 0.0 and c["upper"] == 6.0
+
+
+def test_calibration_plan_name_echoed():
+    payload = _calibration_payload(name="plan-1")
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["name"] == "plan-1"
+    assert data["diagnosis"]["name"] == "plan-1"
+
+
+def test_calibration_plan_result_independent_of_candidate_order():
+    candidates = [
+        {"id": "c1", "source": "A", "target": "B", "min": 0, "max": 9, "cost": 1},
+        {"id": "c2", "source": "A", "target": "B", "min": 0, "max": 8, "cost": 1},
+        {"id": "c3", "source": "A", "target": "B", "min": 0, "max": 4, "cost": 2},
+    ]
+    results = [
+        client.post(
+            "/api/v1/diagnose/calibration-plan",
+            json=_calibration_payload(candidates=list(perm)),
+        ).json()
+        for perm in itertools.permutations(candidates)
+    ]
+    for r in results:
+        assert r["status"] == "ok"
+        assert r["selected_ids"] == ["c3"] and r["total_cost"] == 2
+        assert r["diagnosis"] == results[0]["diagnosis"]
+
+
+def test_calibration_plan_twelve_candidates_accepted():
+    candidates = [
+        {"id": f"c{i:02d}", "source": "A", "target": "B",
+         "min": 0, "max": 10, "cost": 1}
+        for i in range(12)
+    ]
+    candidates[0]["max"] = 4  # 只有 c00 能达标
+    resp = client.post(
+        "/api/v1/diagnose/calibration-plan",
+        json=_calibration_payload(candidates=candidates),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["selected_ids"] == ["c00"] and data["total_cost"] == 1
+
+
+def test_calibration_plan_thirteen_candidates_rejected():
+    candidates = [
+        {"id": f"c{i:02d}", "source": "A", "target": "B",
+         "min": 0, "max": 4, "cost": 1}
+        for i in range(13)
+    ]
+    resp = client.post(
+        "/api/v1/diagnose/calibration-plan",
+        json=_calibration_payload(candidates=candidates),
+    )
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_duplicate_candidate_id_rejected():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1},
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 2, "cost": 1},
+        ],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_candidate_id_collision_with_base_rejected():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "o1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1},
+        ],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_negative_cost_rejected():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": -1},
+        ],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_fractional_cost_rejected():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1.5},
+        ],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_duplicate_target_node_rejected():
+    payload = _calibration_payload(
+        targets=[{"node": "B", "max_width": 4}, {"node": "B", "max_width": 6}],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_empty_targets_rejected():
+    payload = _calibration_payload(targets=[])
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_negative_max_width_rejected():
+    payload = _calibration_payload(targets=[{"node": "B", "max_width": -1}])
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_unknown_field_rejected():
+    payload = _calibration_payload(bogus=1)
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_invalid_candidate_interval_rejected():
+    payload = _calibration_payload(
+        candidates=[
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 9, "max": 1, "cost": 1},
+        ],
+    )
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422

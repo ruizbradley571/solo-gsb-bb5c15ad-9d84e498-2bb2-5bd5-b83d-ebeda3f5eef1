@@ -2,11 +2,23 @@
 
 import itertools
 
-from app.solver import Observation, diagnose, suggest_repair
+from app.solver import (
+    CandidateObservation,
+    Observation,
+    diagnose,
+    plan_calibration,
+    suggest_repair,
+)
 
 
 def _obs(id_, source, target, lo, hi):
     return Observation(id=id_, source=source, target=target, min=lo, max=hi)
+
+
+def _cand(id_, source, target, lo, hi, cost):
+    return CandidateObservation(
+        observation=_obs(id_, source, target, lo, hi), cost=cost
+    )
 
 
 def _bounds(result):
@@ -394,3 +406,220 @@ def test_proof_chain_stays_simple_around_zero_weight_cycle():
         ("z", "upper", "R", "A"),
         ("b", "upper", "A", "V"),
     ]
+
+
+def test_plan_already_satisfied_selects_empty():
+    # 基础系统已满足全部目标：空子集（成本 0）即最优
+    obs = [_obs("o1", "A", "B", 1, 3)]
+    selected, cost, chosen = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[_cand("c1", "A", "B", 0, 1, 0)],
+        targets={"B": 5.0},
+    )
+    assert selected == [] and cost == 0 and chosen == []
+
+
+def test_plan_picks_cheapest_candidate():
+    # c1/c2 各自都能使宽度达标，选成本更低的 c1
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, chosen = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "B", 0, 4, 3),
+            _cand("c2", "A", "B", 0, 4, 5),
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1"] and cost == 3
+    assert [o.id for o in chosen] == ["c1"]
+
+
+def test_plan_tie_on_cost_prefers_fewer_candidates():
+    # c1 单独（成本 2）与 c2+c3（各成本 1）同成本同达标，条数少者胜
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "B", 0, 4, 2),    # 单独: [0,4] 宽 4 达标
+            _cand("c2", "A", "B", 0, 7, 1),    # 单独: [0,7] 宽 7 不达标
+            _cand("c3", "A", "B", 3, 10, 1),   # 单独: [3,10] 宽 7 不达标
+            # c2+c3: [3,7] 宽 4 达标，成本同为 2 但条数更多
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1"] and cost == 2
+
+
+def test_plan_tie_on_cost_and_count_prefers_lex_smallest_ids():
+    # c1/c2 等效同价：选 ID 序列字典序更小者
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c2", "A", "B", 0, 4, 3),
+            _cand("c1", "A", "B", 0, 4, 3),
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1"] and cost == 3
+
+
+def test_plan_lex_sequence_compares_full_sorted_id_list():
+    # {c1,c3} 与 {c2,c3} 同成本同条数同效果：按排序后 ID 序列比较，c1 开头者胜
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "B", 0, 6, 1),    # 单独: [0,6] 宽 6 不达标
+            _cand("c2", "A", "B", 0, 6, 1),    # 单独: [0,6] 宽 6 不达标
+            _cand("c3", "A", "B", 2, 10, 1),   # 单独: [2,10] 宽 8 不达标
+            # c1+c3 / c2+c3: [2,6] 宽 4 达标，成本均为 2
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1", "c3"] and cost == 2
+
+
+def test_plan_skips_contradictory_combination():
+    # c1 与基础观测矛盾（区间不相交），即使最便宜也不可选
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "B", 11, 20, 1),
+            _cand("c2", "A", "B", 0, 4, 2),
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c2"] and cost == 2
+
+
+def test_plan_candidate_pair_only_feasible_together():
+    # c1、c2 单独都不足以收紧到达标，组合后区间相交达标：组合可选
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "B", 0, 8, 1),   # 单独: [0,8] 宽 8 不达标
+            _cand("c2", "A", "B", 4, 10, 1),  # 单独: [4,10] 宽 6 不达标
+            # c1+c2: [4,8] 宽 4 达标
+        ],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1", "c2"] and cost == 2
+
+
+def test_plan_unbounded_target_needs_connecting_candidate():
+    # B 与参考节点不连通：必须借助候选观测才能获得有限界
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[],
+        candidates=[_cand("c1", "A", "B", 1, 4, 2)],
+        targets={"B": 5.0},
+    )
+    assert selected == ["c1"] and cost == 2
+
+
+def test_plan_unbounded_target_without_candidates_has_no_solution():
+    selected, cost, chosen = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[],
+        candidates=[],
+        targets={"B": 5.0},
+    )
+    assert selected is None and cost is None and chosen is None
+
+
+def test_plan_width_too_strict_returns_none():
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, chosen = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[_cand("c1", "A", "B", 0, 4, 1)],
+        targets={"B": 1.0},
+    )
+    assert selected is None and cost is None and chosen is None
+
+
+def test_plan_multiple_targets_all_must_pass():
+    # B 容易达标，C 需要传递收紧：c2 经 B->C 传播使 C 宽度达标
+    obs = [_obs("o1", "A", "B", 0, 10), _obs("o2", "B", "C", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B", "C"],
+        reference="A",
+        observations=obs,
+        candidates=[
+            _cand("c1", "A", "C", 0, 9, 5),   # 只收 C，B 仍宽 10
+            _cand("c2", "A", "B", 0, 4, 3),   # 收 B，同时把 C 收到 14? 不够
+            _cand("c3", "B", "C", 0, 2, 1),   # c2+c3: C 宽 6
+        ],
+        targets={"B": 4.0, "C": 6.0},
+    )
+    # c1 使 C=9 不达标；c2 使 B=4 但 C=14 不达标；c2+c3: B=4, C=6 达标，成本 4
+    assert selected == ["c2", "c3"] and cost == 4
+
+
+def test_plan_zero_cost_candidate_selected_when_needed():
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[_cand("c1", "A", "B", 0, 3, 0)],
+        targets={"B": 3.0},
+    )
+    assert selected == ["c1"] and cost == 0
+
+
+def test_plan_result_independent_of_candidate_order():
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    candidates = [
+        _cand("c1", "A", "B", 0, 9, 1),
+        _cand("c2", "A", "B", 0, 8, 1),
+        _cand("c3", "A", "B", 0, 4, 2),
+        _cand("c4", "A", "B", 0, 4, 3),
+    ]
+    results = [
+        plan_calibration(
+            nodes=["A", "B"],
+            reference="A",
+            observations=obs,
+            candidates=list(perm),
+            targets={"B": 4.0},
+        )
+        for perm in itertools.permutations(candidates)
+    ]
+    first = results[0]
+    assert first[0] == ["c3"] and first[1] == 2
+    for r in results[1:]:
+        assert r[0] == first[0] and r[1] == first[1]
+
+
+def test_plan_exact_width_boundary_is_accepted():
+    # 宽度恰等于上限即达标（<= 语义）
+    obs = [_obs("o1", "A", "B", 0, 10)]
+    selected, cost, _ = plan_calibration(
+        nodes=["A", "B"],
+        reference="A",
+        observations=obs,
+        candidates=[_cand("c1", "A", "B", 2, 6, 1)],
+        targets={"B": 4.0},
+    )
+    assert selected == ["c1"] and cost == 1

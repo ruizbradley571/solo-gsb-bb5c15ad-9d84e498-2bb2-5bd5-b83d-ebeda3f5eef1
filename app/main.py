@@ -1,4 +1,4 @@
-"""FastAPI 入口：单条诊断、批量诊断、修复建议与健康检查。"""
+"""FastAPI 入口：单条诊断、批量诊断、修复建议、校准计划与健康检查。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from .models import (
     BatchDiagnosisRequest,
     BatchDiagnosisResponse,
     BatchItemResponse,
+    CalibrationPlanRequest,
+    CalibrationPlanResponse,
     ContradictionCycle,
     CycleStep,
     DiagnosisRequest,
@@ -20,7 +22,13 @@ from .models import (
     RepairResponse,
     collect_nodes,
 )
-from .solver import Observation, diagnose, suggest_repair
+from .solver import (
+    CandidateObservation,
+    Observation,
+    diagnose,
+    plan_calibration,
+    suggest_repair,
+)
 
 app = FastAPI(
     title="分布式时钟约束诊断 API",
@@ -29,9 +37,11 @@ app = FastAPI(
         "服务将其转换为差分约束，判断时钟偏移是否一致；"
         "可行时给出相对参考节点的最紧上下界及对应的证据链"
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
-        "并可进一步给出最小观测删除集合的修复建议。"
+        "并可进一步给出最小观测删除集合的修复建议，"
+        "或在候选校准观测中规划总成本最小的选用方案，"
+        "使目标节点的偏移区间宽度全部达标。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -157,4 +167,65 @@ def diagnose_repair(request: RepairRequest) -> RepairResponse:
         removed_observation_ids=removed_ids,
         limit_reached=False,
         diagnosis=_diagnosis_model(request.name, repaired),
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/calibration-plan",
+    response_model=CalibrationPlanResponse,
+    tags=["diagnosis"],
+)
+def diagnose_calibration_plan(
+    request: CalibrationPlanRequest,
+) -> CalibrationPlanResponse:
+    """校准计划：选取总成本最小的候选观测子集，使目标节点宽度全部达标。"""
+    base_observations = [_to_observation(o) for o in request.observations]
+    nodes = request.effective_nodes()
+
+    # 基础观测矛盾：直接回传现有矛盾环，不做任何选择
+    base_result = diagnose(
+        nodes=nodes, reference=request.reference, observations=base_observations
+    )
+    if not base_result["feasible"]:
+        return CalibrationPlanResponse(
+            name=request.name,
+            status="base_infeasible",
+            selected_ids=[],
+            total_cost=None,
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    candidates = [
+        CandidateObservation(observation=_to_observation(c), cost=c.cost)
+        for c in request.candidates
+    ]
+    targets = {t.node: t.max_width for t in request.targets}
+    selected_ids, total_cost, selected = plan_calibration(
+        nodes=nodes,
+        reference=request.reference,
+        observations=base_observations,
+        candidates=candidates,
+        targets=targets,
+    )
+    if selected_ids is None:
+        # 无解：回传基础系统的可行诊断，便于对照差距
+        return CalibrationPlanResponse(
+            name=request.name,
+            status="no_feasible_plan",
+            selected_ids=[],
+            total_cost=None,
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    planned = diagnose(
+        nodes=nodes,
+        reference=request.reference,
+        observations=base_observations + selected,
+    )
+    return CalibrationPlanResponse(
+        name=request.name,
+        status="ok",
+        selected_ids=selected_ids,
+        total_cost=total_cost,
+        diagnosis=_diagnosis_model(request.name, planned),
     )

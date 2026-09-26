@@ -42,13 +42,27 @@
 ``suggest_repair`` 在不修改任何观测的前提下，搜索使剩余系统恢复可行的
 最小观测删除集合：按 (删除数量, 观测 ID 字典序) 递增枚举候选，首个可行
 集合即唯一答案，与观测的提交顺序无关。
+
+校准计划
+--------
+``plan_calibration`` 在基础观测可行的前提下，从带非负整数成本的候选校准
+观测中选取子集加入，使所有目标节点相对参考节点的上下界均有限且区间宽度
+不超过各自上限。选择规则唯一确定：
+
+* 首选总成本最小；
+* 同成本取条数最少；
+* 再同取按 ID 排序后序列字典序最小。
+
+任何使「基础 + 已选」不可行的候选组合直接排除（矛盾组合不可选）。
+候选条数有界（至多 12 条），按上述键递增穷举子集，首个满足全部目标
+约束的子集即唯一答案，与候选的提交顺序无关。
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -60,6 +74,14 @@ class Observation:
     target: str
     min: float
     max: float
+
+
+@dataclass(frozen=True)
+class CandidateObservation:
+    """一条候选校准观测：在基础观测之外可选加入，附带非负整数成本。"""
+
+    observation: Observation
+    cost: int
 
 
 @dataclass(frozen=True)
@@ -483,3 +505,62 @@ def suggest_repair(
             if _is_feasible(nodes, remaining):
                 return [o.id for o in combo], remaining
     return None, None
+
+
+def _bounds_meet_targets(
+    result: dict, targets: Dict[str, float]
+) -> bool:
+    """诊断结果是否满足全部目标节点要求：上下界均有限且宽度达标。"""
+    bounds = {b["node"]: b for b in result["node_bounds"]}
+    for node, max_width in targets.items():
+        b = bounds[node]  # 目标节点必在节点集合中，由调用方保证
+        lower, upper = b["lower"], b["upper"]
+        if lower is None or upper is None:
+            return False
+        if upper - lower > max_width:
+            return False
+    return True
+
+
+def plan_calibration(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    candidates: Sequence[CandidateObservation],
+    targets: Dict[str, float],
+) -> Tuple[Optional[List[str]], Optional[int], Optional[List[Observation]]]:
+    """搜索总成本最小的候选校准观测子集，使全部目标节点宽度达标。
+
+    前提：基础观测系统可行（调用方负责先诊断并处理矛盾环）。
+
+    枚举顺序即选择优先级：按 (总成本, 条数, ID 字典序序列) 递增，
+    首个满足以下条件的子集即唯一答案：
+
+    * 加入后系统仍可行（矛盾组合不可选）；
+    * 每个目标节点相对参考节点的上下界均有限，且 ``upper - lower``
+      不超过该节点允许的最大区间宽度。
+
+    返回 ``(selected_ids, total_cost, selected_observations)``；无解时
+    返回 ``(None, None, None)``。``selected_ids`` 按字典序排列，
+    ``selected_observations`` 为选中的候选观测对象（按 ID 排序）。
+    候选条数有界（接口限制至多 12 条），穷举开销可控。
+    """
+    ordered = sorted(candidates, key=lambda c: c.observation.id)
+    base = sorted(observations, key=lambda o: o.id)
+    # 枚举键为 (总成本, 条数, ID 序列)：成本优先，故按成本升序、
+    # 同成本按条数升序枚举子集；条数上界为「总成本不超当前成本」的子集大小。
+    budget = sum(c.cost for c in ordered)
+    for cost in range(budget + 1):
+        max_size = sum(1 for c in ordered if c.cost <= cost)
+        for size in range(min(max_size, len(ordered)) + 1):
+            for combo in itertools.combinations(ordered, size):
+                if sum(c.cost for c in combo) != cost:
+                    continue
+                merged = base + [c.observation for c in combo]
+                result = diagnose(nodes, reference, merged)
+                if not result["feasible"]:
+                    continue  # 矛盾组合不可选
+                if _bounds_meet_targets(result, targets):
+                    ids = [c.observation.id for c in combo]
+                    return ids, cost, [c.observation for c in combo]
+    return None, None, None

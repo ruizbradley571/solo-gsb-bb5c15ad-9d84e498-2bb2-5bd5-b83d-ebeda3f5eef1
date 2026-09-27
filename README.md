@@ -12,7 +12,10 @@
 4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
    **最小观测删除集合**（按删除数量、观测 ID 字典序唯一确定），返回待删观测 ID、
    修复后的诊断摘要，以及是否触及删除上限；
-5. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+5. **校准方案**：基础观测可行时，从至多 12 条带非负整数成本的候选校准观测中，
+   选择使各目标节点相对参考节点的界宽达标的**总成本最小子集**
+   （同成本先比条数、再比 ID 序列字典序），返回选中 ID、总成本与加入后的诊断；
+6. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -320,6 +323,177 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
 }
 ```
 
+### `POST /api/v1/diagnose/calibration-plan` — 校准方案
+
+在基础观测之外，给定若干**目标节点允许的最大偏移区间宽度**，以及**至多 12 条**
+带唯一 ID、**非负整数成本**的候选校准观测；服务从候选中选择满足要求的
+**总成本最小**子集。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` / `name`），
+另增加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `targets` | array | 是 | 至少 1 个校准目标，节点不可重复 |
+| `targets[].node` | string | 是 | 目标时钟节点（自动纳入节点集合） |
+| `targets[].max_width` | number | 是 | 允许的最大界宽 `upper - lower`（毫秒），须 ≥ 0 |
+| `candidates` | array | 否 | 候选校准观测，至多 12 条，默认空数组 |
+| `candidates[].id` | string | 是 | 候选唯一 ID；候选间、候选与基础观测间均不可重复 |
+| `candidates[].source` / `target` / `min` / `max` | - | 是 | 与普通观测语义相同，`min ≤ max` |
+| `candidates[].cost` | integer | 是 | 选用该观测的成本，须为 **非负整数** |
+
+合格子集必须同时满足：
+
+1. 基础观测 + 该子集**仍然可行**（无矛盾环）——任何引入矛盾的组合都不可选
+   （包括与基础观测冲突或候选彼此冲突的情况，即使矛盾出现在与参考节点
+   不连通的分量上）；
+2. 加入后每个目标节点相对参考节点的**上、下界均有限**（双向可达），
+   且界宽 `upper - lower ≤ max_width`。
+
+择优顺序唯一确定：**总成本最小 → 条数最少 → 选中 ID（字典序排列后）序列
+字典序最小**。注意总成本是第一关键字，因此两条低成本组合可以胜过一条
+高成本单观测。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `optimal` / `base_contradiction` / `no_solution` |
+| `selected_observation_ids` | string[] | 选中的候选 ID（字典序）；非 optimal 时为空 |
+| `total_cost` | integer | 选中观测成本之和；非 optimal 时为 0 |
+| `diagnosis` | object/null | `optimal`：加入选中观测后的完整诊断（含证据链）；`base_contradiction`：基础观测的矛盾诊断；`no_solution`：`null` |
+
+三种状态：
+
+- **`base_contradiction`**：基础观测本身矛盾，直接返回与单条诊断一致的
+  矛盾环，不进行候选搜索；
+- **`optimal`**：存在合格子集（空集也算，此时 `selected_observation_ids` 为
+  空、`total_cost=0`）；`diagnosis` 的节点集合按「显式 `nodes` ∪ `reference`
+  ∪ 基础观测端点 ∪ **被选**候选端点」计算——未选中候选的端点不会出现；
+- **`no_solution`**：基础观测可行，但任何候选组合要么引入矛盾、要么无法让
+  所有目标界有限且宽度达标（候选为空时也可能出现）。
+
+#### 校准成功（示例）
+
+基础观测 `B-A ∈ [0,10]`（宽 10），要求宽度 ≤ 3：精确点观测成本 10；
+另两条各成本 1 的观测组合后宽度为 2，总成本 2 更低，故选择组合：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+    ],
+    "targets": [{"node": "B", "max_width": 3}],
+    "candidates": [
+      {"id": "exact", "source": "A", "target": "B", "min": 2, "max": 2, "cost": 10},
+      {"id": "lo",    "source": "A", "target": "B", "min": 0, "max": 4, "cost": 1},
+      {"id": "hi",    "source": "B", "target": "A", "min": -6, "max": -2, "cost": 1}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "optimal",
+  "selected_observation_ids": ["hi", "lo"],
+  "total_cost": 2,
+  "diagnosis": {
+    "feasible": true,
+    "reference": "A",
+    "name": null,
+    "node_bounds": [
+      {"node": "A", "lower": 0.0, "upper": 0.0,
+       "lower_proof": [], "upper_proof": [],
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true},
+      {"node": "B", "lower": 2.0, "upper": 4.0,
+       "lower_proof": [
+         {"observation_id": "hi", "constraint": "upper", "from": "B", "to": "A", "weight": -2.0}
+       ],
+       "upper_proof": [
+         {"observation_id": "lo", "constraint": "upper", "from": "A", "to": "B", "weight": 4.0}
+       ],
+       "reachable_from_reference": true, "can_reach_reference": true, "constrained": true}
+    ],
+    "unconstrained_nodes": []
+  }
+}
+```
+
+加入 `lo`（`B-A ∈ [0,4]`）与 `hi`（`B-A ∈ [2,6]`）后交集为 `[2,4]`，宽 2 ≤ 3。
+
+#### 基础矛盾（示例）
+
+基础观测已构成矛盾环时直接回传矛盾，`status="base_contradiction"`
+（`diagnosis` 结构与单条诊断的不可行响应完全一致）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ],
+    "targets": [{"node": "B", "max_width": 1}],
+    "candidates": []
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "base_contradiction",
+  "selected_observation_ids": [],
+  "total_cost": 0,
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "o2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "o1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
+#### 无解（示例）
+
+目标节点 `C` 无法通过任何候选与参考节点连通（上下界不可能同时有限）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+    ],
+    "targets": [{"node": "C", "max_width": 1}],
+    "candidates": []
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "no_solution",
+  "selected_observation_ids": [],
+  "total_cost": 0,
+  "diagnosis": null
+}
+```
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -346,7 +520,9 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
 ### 校验错误
 
 非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中等请求问题返回
-HTTP `422` 及详细错误信息。
+HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` 为空或目标重复、
+`max_width < 0`、候选超过 12 条、候选成本为负或非整数、候选 ID 彼此重复或与
+基础观测 ID 冲突、候选区间非法等。
 
 ---
 
@@ -365,7 +541,10 @@ HTTP `422` 及详细错误信息。
 - **证据链**：上界链为 `r` 到 `v` 的最短路本身（沿原图方向），下界链为 `v` 到 `r`
   的最短路本身；链即界的可审计解释；
 - **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
-  集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解。
+  集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解；
+- **校准**：候选至多 12 条，穷举至多 2^12 = 4096 个子集；每个子集先做负环
+  检测（矛盾组合不可选），可行时再跑双向最短路核对各目标界宽；按
+  (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关。
 
 结果顺序的确定性保证：
 
@@ -380,10 +559,10 @@ HTTP `422` 及详细错误信息。
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索
-tests/         # 算法层与 HTTP 接口测试（52 个用例）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案
+tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml
 ```

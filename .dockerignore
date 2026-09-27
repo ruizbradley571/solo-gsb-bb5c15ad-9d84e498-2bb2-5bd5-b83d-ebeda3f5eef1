@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .git/
 .venv/
+.vendor/
 venv/
 tests/
 *.md

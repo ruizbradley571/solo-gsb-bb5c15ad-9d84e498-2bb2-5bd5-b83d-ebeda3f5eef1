@@ -42,6 +42,13 @@
 ``suggest_repair`` 在不修改任何观测的前提下，搜索使剩余系统恢复可行的
 最小观测删除集合：按 (删除数量, 观测 ID 字典序) 递增枚举候选，首个可行
 集合即唯一答案，与观测的提交顺序无关。
+
+校准方案
+--------
+``plan_calibration`` 在基础观测之外，从至多 12 条带非负整数成本的候选
+校准观测中选子集：组合必须保持系统可行（含矛盾的组合不可选），且使各
+目标节点相对参考节点的上下界均有限、宽度不超过给定上限。答案按
+(总成本, 条数, ID 序列字典序) 唯一确定。
 """
 
 from __future__ import annotations
@@ -70,6 +77,13 @@ class Edge:
     observation_id: str
     kind: str  # "upper"（上界边）或 "lower"（下界边）
     bound: float  # 对应观测的原始端点（upper->max, lower->min）
+
+
+@dataclass(frozen=True)
+class CalibrationCandidate(Observation):
+    """一条带成本的候选校准观测：成本为非负整数。"""
+
+    cost: int = 0
 
 
 def _norm(value: float) -> float:
@@ -483,3 +497,103 @@ def suggest_repair(
             if _is_feasible(nodes, remaining):
                 return [o.id for o in combo], remaining
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# 校准方案
+# ---------------------------------------------------------------------------
+
+# 宽度达标比较使用的浮点容差（相对宽度 + 绝对误差），避免 2-1 != 1 之类的
+# 表示误差把已达标的方案误判为不达标。
+_WIDTH_EPS = 1e-9
+
+
+def _width_ok(dist, dist_rev, targets) -> bool:
+    """各目标节点相对参考节点的上下界是否均有限且宽度达标。
+
+    ``dist`` / ``dist_rev`` 为正图 / 反图从参考节点出发的最短路距离；
+    ``targets`` 为 ``(node, max_width)`` 序列。上界缺失（不可达）、
+    下界缺失或 ``upper - lower > max_width`` 均视为不达标。
+    """
+    inf = float("inf")
+    for node, max_width in targets:
+        if dist[node] == inf or dist_rev[node] == inf:
+            return False
+        width = dist[node] + dist_rev[node]  # upper - lower（lower = -dist_rev）
+        if width > max_width + _WIDTH_EPS * max(1.0, abs(max_width)):
+            return False
+    return True
+
+
+def plan_calibration(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    targets: Sequence[Tuple[str, float]],
+    candidates: Sequence[CalibrationCandidate],
+) -> Optional[Tuple[List[str], int, List[Observation]]]:
+    """选择总成本最小的候选校准观测子集（调用方须保证基础观测本身可行）。
+
+    一个子集合格当且仅当：
+
+    1. 基础观测 + 该子集组成的约束系统**可行**（无负环）——因此引入矛盾的
+       候选组合不可选（包括与基础观测冲突、候选彼此冲突的情况）；
+    2. 加入后每个目标节点相对参考节点的最紧上、下界**均有限**
+       （两个方向都可达），且界宽 ``upper - lower`` 不超过该节点给定的
+       最大允许宽度。
+
+    合格子集按 **(总成本, 条数, ID 序列字典序)** 取最小者；ID 序列指
+    选中候选 ID 按字典序排列后的列表。候选至多 12 条，故按
+    ``(条数, ID 字典序)`` 分层枚举至多 2^12 = 4096 个子集即可穷举。
+
+    返回 ``(selected_ids, total_cost, selected_observations)``；
+    空集即合格时返回 ``([], 0, [])``；无合格子集时返回 ``None``。
+    """
+    # 候选端点即使最终未被选中，也必须在评估图的节点宇宙中，
+    # 否则枚举到含该候选的组合时 Bellman-Ford 会遇到未知节点。
+    all_nodes = set(nodes)
+    for c in candidates:
+        all_nodes.add(c.source)
+        all_nodes.add(c.target)
+    ordered_nodes = sorted(all_nodes)
+    ordered = sorted(candidates, key=lambda c: c.id)
+
+    base_edges = _build_edges(observations)
+    # id(candidate) -> 该候选展开的两条边，评估时避免重复建边。
+    edges_by_candidate = {id(c): _build_edges([c]) for c in ordered}
+
+    def evaluate(chosen: Sequence[CalibrationCandidate]):
+        """检查被选子集：先做负环检测，可行时跑双向 Bellman-Ford 验宽度。"""
+        edges = list(base_edges)
+        for c in chosen:
+            edges.extend(edges_by_candidate[id(c)])
+        if _extract_negative_cycle(edges, ordered_nodes) is not None:
+            return False
+        dist, _ = _bellman_ford(edges, ordered_nodes, reference)
+        reverse_edges = [_unreverse(e) for e in edges]
+        dist_rev, _ = _bellman_ford(reverse_edges, ordered_nodes, reference)
+        return _width_ok(dist, dist_rev, targets)
+
+    # 空集优先：基础观测已经使所有目标达标时无需任何校准。
+    if evaluate([]):
+        return [], 0, []
+
+    best: Optional[Tuple[int, int, List[str], List[CalibrationCandidate]]] = None
+    # 注意：总成本是第一排序键，因此低层（条数少）找到的方案总成本可能更高，
+    # 不能因低层已有解而跳过高层；只能剪掉总成本严格更大的组合。
+    # 等成本组合仍需评估，由 (cost, k, ids) 全键比较决定条数与字典序胜负。
+    for k in range(1, len(ordered) + 1):
+        for combo in itertools.combinations(ordered, k):
+            cost = sum(c.cost for c in combo)
+            if best is not None and cost > best[0]:
+                continue
+            if not evaluate(combo):
+                continue
+            ids = [c.id for c in combo]
+            if best is None or (cost, k, ids) < (best[0], best[1], best[2]):
+                best = (cost, k, ids, list(combo))
+
+    if best is None:
+        return None
+    _, _, ids, chosen = best
+    return ids, best[0], chosen

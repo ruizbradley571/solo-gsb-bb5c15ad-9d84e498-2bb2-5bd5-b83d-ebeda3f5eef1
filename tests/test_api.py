@@ -473,3 +473,300 @@ def test_repair_explicit_nodes_are_retained():
     diag = data["diagnosis"]
     assert [b["node"] for b in diag["node_bounds"]] == ["A", "B", "C"]
     assert diag["unconstrained_nodes"] == ["C"]
+
+
+# ---------------------------------------------------------------------------
+# 校准方案
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_plan_optimal_combination():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+        ],
+        "targets": [{"node": "B", "max_width": 3}],
+        "candidates": [
+            {"id": "exact", "source": "A", "target": "B",
+             "min": 2, "max": 2, "cost": 10},
+            {"id": "lo", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1},
+            {"id": "hi", "source": "B", "target": "A",
+             "min": -6, "max": -2, "cost": 1},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "optimal"
+    assert data["selected_observation_ids"] == ["hi", "lo"]
+    assert data["total_cost"] == 2
+    diag = data["diagnosis"]
+    assert diag["feasible"] is True
+    bounds = {b["node"]: b for b in diag["node_bounds"]}
+    # B-A ∈ [0,10] ∩ [0,4] ∩ [2,6] = [2,4]，宽 2
+    assert bounds["B"]["lower"] == 2.0 and bounds["B"]["upper"] == 4.0
+
+
+def test_calibration_plan_cost_beats_count():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+        ],
+        "targets": [{"node": "B", "max_width": 3}],
+        "candidates": [
+            {"id": "exact", "source": "A", "target": "B",
+             "min": 2, "max": 2, "cost": 10},
+            {"id": "lo", "source": "A", "target": "B",
+             "min": 0, "max": 4, "cost": 1},
+            {"id": "hi", "source": "B", "target": "A",
+             "min": -6, "max": -2, "cost": 1},
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    # 成本 1+1=2 < exact 的 10，尽管条数更多
+    assert data["status"] == "optimal"
+    assert data["selected_observation_ids"] == ["hi", "lo"]
+
+
+def test_calibration_plan_empty_selection_when_already_qualified():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "base", "source": "A", "target": "B", "min": 0, "max": 2}
+        ],
+        "targets": [{"node": "B", "max_width": 2}],
+        "candidates": [
+            {"id": "exact", "source": "A", "target": "B",
+             "min": 1, "max": 1, "cost": 1}
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "optimal"
+    assert data["selected_observation_ids"] == []
+    assert data["total_cost"] == 0
+    assert data["diagnosis"]["feasible"] is True
+
+
+def test_calibration_plan_base_contradiction():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": "exact", "source": "A", "target": "B",
+             "min": 2, "max": 2, "cost": 1}
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "base_contradiction"
+    assert data["selected_observation_ids"] == []
+    assert data["total_cost"] == 0
+    assert data["diagnosis"]["feasible"] is False
+    assert data["diagnosis"]["cycle"]["accumulated_bound"] == -3.0
+
+
+def test_calibration_plan_no_solution_when_unreachable():
+    # C 为已声明目标，但无基础观测、无候选可将其与 A 连通 -> 无解
+    payload = {
+        "reference": "A",
+        "nodes": ["A", "C"],
+        "observations": [],
+        "targets": [{"node": "C", "max_width": 1}],
+        "candidates": [],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "no_solution"
+    assert data["selected_observation_ids"] == []
+    assert data["total_cost"] == 0
+    assert data["diagnosis"] is None
+
+
+def test_calibration_plan_contradictory_candidate_unselectable():
+    # 候选与基础观测矛盾（B-A ∈ [11,20] ∩ [0,10] 为空），无解
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+        ],
+        "targets": [{"node": "B", "max_width": 3}],
+        "candidates": [
+            {"id": "bad", "source": "B", "target": "A",
+             "min": 11, "max": 20, "cost": 0}
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "no_solution"
+    assert data["diagnosis"] is None
+
+
+def test_calibration_plan_final_diagnosis_excludes_unselected_endpoints():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "base", "source": "A", "target": "B", "min": 0, "max": 10}
+        ],
+        "targets": [{"node": "B", "max_width": 3}],
+        "candidates": [
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 1},
+            {"id": "unused", "source": "C", "target": "D",
+             "min": 0, "max": 0, "cost": 0},
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "optimal"
+    assert data["selected_observation_ids"] == ["c1"]
+    # C/D 仅出现在未选中的候选中，最终诊断不包含它们
+    assert [b["node"] for b in data["diagnosis"]["node_bounds"]] == ["A", "B"]
+
+
+def test_calibration_plan_duplicate_target_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 2}
+        ],
+        "targets": [
+            {"node": "B", "max_width": 1},
+            {"node": "B", "max_width": 2},
+        ],
+        "candidates": [],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_empty_targets_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [],
+        "candidates": [],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_duplicate_candidate_id_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": "x", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 1},
+            {"id": "x", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 2},
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_candidate_id_collides_base_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 5}
+        ],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": "o1", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 1}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_negative_cost_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": -1}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_non_integer_cost_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": "c1", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 1.5}
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_negative_max_width_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "A", "max_width": -1}],
+        "candidates": [],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_too_many_candidates_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "B", "max_width": 1}],
+        "candidates": [
+            {"id": f"c{i:02d}", "source": "A", "target": "B",
+             "min": 0, "max": 1, "cost": 1}
+            for i in range(13)
+        ],
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_unknown_field_rejected():
+    payload = {
+        "reference": "A",
+        "observations": [],
+        "targets": [{"node": "A", "max_width": 1}],
+        "candidates": [],
+        "bogus": 1,
+    }
+    resp = client.post("/api/v1/diagnose/calibration-plan", json=payload)
+    assert resp.status_code == 422
+
+
+def test_calibration_plan_candidate_connects_new_target():
+    # C 原本不存在于任何基础观测；通过显式 nodes 声明目标，
+    # 候选 A->C 将其连通并收窄
+    payload = {
+        "reference": "A",
+        "nodes": ["A", "C"],
+        "observations": [],
+        "targets": [{"node": "C", "max_width": 2}],
+        "candidates": [
+            {"id": "link", "source": "A", "target": "C",
+             "min": 1, "max": 3, "cost": 4}
+        ],
+    }
+    data = client.post("/api/v1/diagnose/calibration-plan", json=payload).json()
+    assert data["status"] == "optimal"
+    assert data["selected_observation_ids"] == ["link"]
+    assert data["total_cost"] == 4
+    bounds = {b["node"]: b for b in data["diagnosis"]["node_bounds"]}
+    assert bounds["C"]["lower"] == 1.0 and bounds["C"]["upper"] == 3.0

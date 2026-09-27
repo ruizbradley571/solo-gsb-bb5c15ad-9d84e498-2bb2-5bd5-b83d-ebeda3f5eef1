@@ -2,11 +2,23 @@
 
 import itertools
 
-from app.solver import Observation, diagnose, suggest_repair
+from app.solver import (
+    CalibrationCandidate,
+    Observation,
+    diagnose,
+    plan_calibration,
+    suggest_repair,
+)
 
 
 def _obs(id_, source, target, lo, hi):
     return Observation(id=id_, source=source, target=target, min=lo, max=hi)
+
+
+def _cand(id_, source, target, lo, hi, cost):
+    return CalibrationCandidate(
+        id=id_, source=source, target=target, min=lo, max=hi, cost=cost
+    )
 
 
 def _bounds(result):
@@ -394,3 +406,148 @@ def test_proof_chain_stays_simple_around_zero_weight_cycle():
         ("z", "upper", "R", "A"),
         ("b", "upper", "A", "V"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# 校准方案
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_empty_when_base_already_meets_targets():
+    # 基础观测 B-A ∈ [0,10]，目标宽度 10：无需任何候选
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [_cand("cal-a", "A", "B", 2, 2, 10)]
+    plan = plan_calibration(
+        ["A", "B"], "A", base, [("B", 10)], cands
+    )
+    assert plan == ([], 0, [])
+
+
+def test_calibration_picks_minimum_cost_single():
+    # 目标宽度 3：cal-a（精确点）成本 10，cal-c 单独即可（宽度 0）成本 2
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [
+        _cand("cal-a", "A", "B", 2, 2, 10),
+        _cand("cal-b", "A", "B", 0, 4, 1),
+        _cand("cal-c", "B", "A", 0, 2, 2),  # B-A ∈ [-2, 0]，与 base 交集宽 0
+    ]
+    plan = plan_calibration(["A", "B"], "A", base, [("B", 3)], cands)
+    ids, cost, chosen = plan
+    assert ids == ["cal-c"] and cost == 2 and [o.id for o in chosen] == ["cal-c"]
+
+
+def test_calibration_requires_combination():
+    # 两个候选单独宽度均为 4（>3），组合后宽度为 2
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [
+        _cand("cal-a", "A", "B", 2, 2, 10),  # 精确点，成本 10
+        _cand("cal-b", "A", "B", 0, 4, 1),
+        _cand("cal-c", "B", "A", -6, -2, 1),  # B-A ∈ [2, 6]
+    ]
+    plan = plan_calibration(["A", "B"], "A", base, [("B", 3)], cands)
+    ids, cost, _ = plan
+    assert ids == ["cal-b", "cal-c"] and cost == 2
+
+
+def test_calibration_cost_beats_count():
+    # 单条精确观测成本 10；两条组合成本 1+1=2 -> 选组合（总成本优先于条数）
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [
+        _cand("single", "A", "B", 2, 2, 10),
+        _cand("p", "A", "B", 0, 4, 1),
+        _cand("q", "B", "A", -6, -2, 1),
+    ]
+    plan = plan_calibration(["A", "B"], "A", base, [("B", 3)], cands)
+    ids, cost, _ = plan
+    assert ids == ["p", "q"] and cost == 2
+
+
+def test_calibration_equal_cost_prefers_fewer_then_lex():
+    base = [_obs("base", "A", "B", 0, 10)]
+    # 同成本 5：p、q 各自单独合格，单条优于多条，p < q
+    cands = [
+        _cand("q", "A", "B", 2, 2, 5),
+        _cand("p", "A", "B", 2, 2, 5),
+    ]
+    plan = plan_calibration(["A", "B"], "A", base, [("B", 3)], cands)
+    assert plan[0] == ["p"] and plan[1] == 5
+
+    # 同成本同条数：两条等合格组合，取 ID 序列字典序小
+    cands2 = [
+        _cand("x", "A", "B", 0, 4, 2),
+        _cand("y", "B", "A", -6, -2, 3),  # x+y 成本 5
+        _cand("p", "A", "B", 0, 4, 2),
+        _cand("q", "B", "A", -6, -2, 3),  # p+q 成本 5，字典序更小
+    ]
+    plan2 = plan_calibration(["A", "B"], "A", base, [("B", 3)], cands2)
+    assert plan2[0] == ["p", "q"] and plan2[1] == 5
+
+
+def test_calibration_contradictory_combination_unselectable():
+    # bad 自身可行但与基础观测矛盾（B-A ∈ [11,20] ∩ [0,10] = 空）
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [_cand("bad", "B", "A", 11, 20, 0)]
+    assert plan_calibration(["A", "B"], "A", base, [("B", 3)], cands) is None
+
+
+def test_calibration_candidate_pair_conflict_unselectable():
+    # p 单独宽度不足（4 > 3）；q 与基础观测（B-A ∈ [0,100]）矛盾
+    # （A-B ∈ [5,10] => B-A ∈ [-10,-5]）；任何含 q 的组合均不可选 -> 无解
+    base = [_obs("base", "A", "B", 0, 100)]
+    cands = [
+        _cand("p", "A", "B", 0, 4, 1),
+        _cand("q", "B", "A", 5, 10, 1),
+    ]
+    assert plan_calibration(["A", "B"], "A", base, [("B", 3)], cands) is None
+
+
+def test_calibration_unreachable_target_no_solution():
+    # C 与参考节点 A 不在同一分量，候选也未连通 -> 无解
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [_cand("self", "D", "D", 0, 0, 0)]
+    assert (
+        plan_calibration(["A", "B", "C", "D"], "A", base, [("C", 5)], cands) is None
+    )
+
+
+def test_calibration_disconnected_self_loop_contradiction_blocks():
+    # 候选在与参考节点不连通的分量上构成自环矛盾：组合不可选
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [_cand("bad", "C", "C", 1, 2, 0)]
+    assert plan_calibration(["A", "B", "C"], "A", base, [("B", 3)], cands) is None
+
+
+def test_calibration_multiple_targets_must_all_hold():
+    # B、C 两个目标：只校准 B 不够，必须同时收窄 C
+    base = [
+        _obs("b", "A", "B", 0, 10),
+        _obs("c", "A", "C", 0, 10),
+    ]
+    cands = [
+        _cand("cb", "A", "B", 0, 2, 1),
+        _cand("cc", "A", "C", 0, 2, 1),
+    ]
+    partial = plan_calibration(
+        ["A", "B", "C"], "A", base, [("B", 3), ("C", 3)], cands[:1]
+    )
+    assert partial is None
+    full = plan_calibration(
+        ["A", "B", "C"], "A", base, [("B", 3), ("C", 3)], cands
+    )
+    assert full[0] == ["cb", "cc"] and full[1] == 2
+
+
+def test_calibration_independent_of_submission_order():
+    base = [_obs("base", "A", "B", 0, 10)]
+    cands = [
+        _cand("cal-a", "A", "B", 2, 2, 10),
+        _cand("cal-b", "A", "B", 0, 4, 1),
+        _cand("cal-c", "B", "A", -6, -2, 1),
+    ]
+    plans = [
+        plan_calibration(["A", "B"], "A", base, [("B", 3)], list(perm))
+        for perm in itertools.permutations(cands)
+    ]
+    for plan in plans[1:]:
+        assert (plan[0], plan[1]) == (plans[0][0], plans[0][1])
+    assert plans[0][0] == ["cal-b", "cal-c"]

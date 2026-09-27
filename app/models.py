@@ -222,3 +222,101 @@ class RepairResponse(BaseModel):
     diagnosis: Union[FeasibleDiagnosis, InfeasibleDiagnosis] = Field(
         ..., discriminator="feasible", description="应用建议后的诊断摘要"
     )
+
+
+class CalibrationTargetIn(BaseModel):
+    """校准目标：要求该节点相对参考节点的界宽不超过 max_width（毫秒）。"""
+
+    node: str = Field(..., min_length=1, description="目标时钟节点")
+    max_width: float = Field(
+        ..., ge=0, description="允许的最大偏移区间宽度 upper - lower（毫秒），须 ≥ 0"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "CalibrationTargetIn":
+        if not math.isfinite(self.max_width):
+            raise ValueError("max_width 必须为有限数值")
+        return self
+
+
+class CalibrationCandidateIn(ObservationIn):
+    """一条候选校准观测：在普通观测的基础上附带非负整数成本。"""
+
+    cost: int = Field(
+        ..., ge=0, description="选用该观测的成本（非负整数）"
+    )
+
+
+class CalibrationPlanRequest(DiagnosisRequest):
+    """校准方案请求：沿用诊断字段，另给目标宽度与至多 12 条候选观测。"""
+
+    targets: List[CalibrationTargetIn] = Field(
+        ..., min_length=1, description="需要校准（收窄界宽）的目标节点列表"
+    )
+    candidates: List[CalibrationCandidateIn] = Field(
+        default_factory=list,
+        max_length=12,
+        description="至多 12 条带唯一 ID、非负整数成本的候选校准观测",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "CalibrationPlanRequest":
+        # 复用基础诊断的全部校验（reference∈nodes、基础观测 ID 唯一等）。
+        DiagnosisRequest._check(self)
+
+        if len({t.node for t in self.targets}) != len(self.targets):
+            raise ValueError("targets 中存在重复目标节点")
+
+        candidate_ids = [c.id for c in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("candidates 中存在重复的候选观测 ID")
+
+        base_ids = {o.id for o in self.observations}
+        overlap = base_ids.intersection(candidate_ids)
+        if overlap:
+            raise ValueError(
+                f"候选观测 ID 与基础观测 ID 冲突：{sorted(overlap)}"
+            )
+        return self
+
+    def effective_nodes(self) -> List[str]:
+        """合并显式节点、观测端点、参考节点与校准目标节点。
+
+        目标节点即纳入节点宇宙（等价于在 nodes 中显式声明），
+        加入观测后仍不可达时会在结果中表现为未约束 / 无解。
+        """
+        nodes = set(super().effective_nodes())
+        nodes.update(t.node for t in self.targets)
+        return sorted(nodes)
+
+
+class CalibrationPlanResponse(BaseModel):
+    """校准方案响应。
+
+    * ``status="optimal"``：找到合格子集（空集也算），``selected_observation_ids`` /
+      ``total_cost`` 给出选择，``diagnosis`` 为加入所选观测后的可行诊断；
+    * ``status="base_contradiction"``：基础观测本身矛盾，直接回传其矛盾环
+      （``selected_observation_ids`` 为空、``total_cost=0``）；
+    * ``status="no_solution"``：基础可行但不存在合格子集（任何候选组合都会
+      引入矛盾，或加入后仍无法让所有目标界有限且宽度达标）。
+    """
+
+    name: Optional[str] = None
+    status: Literal["optimal", "base_contradiction", "no_solution"] = Field(
+        ..., description="求解状态"
+    )
+    selected_observation_ids: List[str] = Field(
+        ...,
+        description="选中的候选校准观测 ID（按字典序）；基础矛盾或无解时为空列表",
+    )
+    total_cost: int = Field(
+        ..., description="选中观测的成本之和；基础矛盾或无解时为 0"
+    )
+    diagnosis: Optional[Union[FeasibleDiagnosis, InfeasibleDiagnosis]] = Field(
+        ...,
+        discriminator="feasible",
+        description="optimal 时为加入所选观测后的诊断；"
+        "base_contradiction 时为基础观测的矛盾诊断；no_solution 时为 null",
+    )

@@ -10,6 +10,8 @@ from .models import (
     BatchDiagnosisRequest,
     BatchDiagnosisResponse,
     BatchItemResponse,
+    CalibrationPlanRequest,
+    CalibrationPlanResponse,
     ContradictionCycle,
     CycleStep,
     DiagnosisRequest,
@@ -20,7 +22,13 @@ from .models import (
     RepairResponse,
     collect_nodes,
 )
-from .solver import Observation, diagnose, suggest_repair
+from .solver import (
+    CalibrationCandidate,
+    Observation,
+    diagnose,
+    plan_calibration,
+    suggest_repair,
+)
 
 app = FastAPI(
     title="分布式时钟约束诊断 API",
@@ -29,9 +37,10 @@ app = FastAPI(
         "服务将其转换为差分约束，判断时钟偏移是否一致；"
         "可行时给出相对参考节点的最紧上下界及对应的证据链"
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
-        "并可进一步给出最小观测删除集合的修复建议。"
+        "并可进一步给出最小观测删除集合的修复建议；"
+        "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -42,6 +51,17 @@ def _to_observation(raw) -> Observation:
         target=raw.target,
         min=raw.min,
         max=raw.max,
+    )
+
+
+def _to_candidate(raw) -> CalibrationCandidate:
+    return CalibrationCandidate(
+        id=raw.id,
+        source=raw.source,
+        target=raw.target,
+        min=raw.min,
+        max=raw.max,
+        cost=raw.cost,
     )
 
 
@@ -157,4 +177,70 @@ def diagnose_repair(request: RepairRequest) -> RepairResponse:
         removed_observation_ids=removed_ids,
         limit_reached=False,
         diagnosis=_diagnosis_model(request.name, repaired),
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/calibration-plan",
+    response_model=CalibrationPlanResponse,
+    tags=["diagnosis"],
+)
+def diagnose_calibration_plan(request: CalibrationPlanRequest) -> CalibrationPlanResponse:
+    """校准方案：从候选观测中选总成本最小的子集，使各目标节点界宽达标。
+
+    基础观测本身矛盾时直接回传现有矛盾环（status=base_contradiction）；
+    否则枚举候选子集，矛盾组合不可选，并要求加入后各目标节点相对参考
+    节点的上下界均有限、宽度不超过给定上限；同成本先取条数少、再取
+    ID 序列字典序小；无合格子集时 status=no_solution。
+    """
+    base_observations = [_to_observation(o) for o in request.observations]
+    # 节点集合纳入所有候选端点：未被选中的候选端点不应出现在最终诊断中，
+    # 最终诊断的节点集合在求解后按「基础观测 ∪ 被选候选 ∪ 显式 nodes」重算。
+    nodes = request.effective_nodes()
+
+    base_result = diagnose(
+        nodes=nodes,
+        reference=request.reference,
+        observations=base_observations,
+    )
+    if not base_result["feasible"]:
+        return CalibrationPlanResponse(
+            name=request.name,
+            status="base_contradiction",
+            selected_observation_ids=[],
+            total_cost=0,
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    plan = plan_calibration(
+        nodes=nodes,
+        reference=request.reference,
+        observations=base_observations,
+        targets=[(t.node, t.max_width) for t in request.targets],
+        candidates=[_to_candidate(c) for c in request.candidates],
+    )
+    if plan is None:
+        return CalibrationPlanResponse(
+            name=request.name,
+            status="no_solution",
+            selected_observation_ids=[],
+            total_cost=0,
+            diagnosis=None,
+        )
+
+    selected_ids, total_cost, selected_observations = plan
+    final_nodes = collect_nodes(
+        request.nodes, request.reference, base_observations + selected_observations
+    )
+    final_result = diagnose(
+        nodes=final_nodes,
+        reference=request.reference,
+        observations=base_observations + selected_observations,
+    )
+    return CalibrationPlanResponse(
+        name=request.name,
+        status="optimal",
+        selected_observation_ids=selected_ids,
+        total_cost=total_cost,
+        diagnosis=_diagnosis_model(request.name, final_result),
     )
